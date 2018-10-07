@@ -1,8 +1,8 @@
 package examples
 
 import (
-	"github.com/Lobaro/lora-packet-forwarder-client/gateway"
-	"github.com/Lobaro/lora-packet-forwarder-client/gateway/band"
+	"github.com/maledog/lora-packet-forwarder-client/gateway"
+	"github.com/maledog/lora-packet-forwarder-client/gateway/band"
 	"github.com/apex/log"
 )
 
