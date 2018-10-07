@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"regexp"
 	"strconv"
@@ -11,11 +12,10 @@ import (
 	"time"
 
 	"github.com/maledog/lora-packet-forwarder-client/gateway/band"
-	log "github.com/Sirupsen/logrus"
 )
 
 var errGatewayDoesNotExist = errors.New("gateway does not exist")
-var gatewayCleanupDuration = -1 * time.Minute
+var gatewayCleanupDuration = 1 * time.Minute
 var loRaDataRateRegex = regexp.MustCompile(`SF(\d+)BW(\d+)`)
 
 type udpPacket struct {
@@ -62,14 +62,15 @@ func (c *gateways) set(mac Mac, gw gateway) error {
 func (c *gateways) cleanup() error {
 	defer c.Unlock()
 	c.Lock()
-	for mac := range c.gateways {
-		if c.gateways[mac].lastSeen.Before(time.Now().Add(gatewayCleanupDuration)) {
+	for gw := range c.gateways {
+		if time.Now().After(c.gateways[gw].lastSeen.Add(gatewayCleanupDuration)) {
 			if c.onDelete != nil {
-				if err := c.onDelete(mac); err != nil {
+				err := c.onDelete(gw)
+				if err != nil {
 					return err
 				}
 			}
-			delete(c.gateways, mac)
+			delete(c.gateways, gw)
 		}
 	}
 	return nil
@@ -77,9 +78,7 @@ func (c *gateways) cleanup() error {
 
 // Client implements a Semtech gateway client/backend.
 type Client struct {
-	CheckCrc bool
-
-	log         *log.Logger
+	CheckCrc    bool
 	conn        *net.UDPConn
 	rxChan      chan RXPacketBytes
 	statsChan   chan GatewayStatsPacket
@@ -89,13 +88,11 @@ type Client struct {
 	wg          sync.WaitGroup
 }
 
-// NewClient creates a new Client.
 func NewClient(bind string, onNew func(Mac) error, onDelete func(Mac) error) (*Client, error) {
 	addr, err := net.ResolveUDPAddr("udp", bind)
 	if err != nil {
 		return nil, err
 	}
-	log.WithField("addr", addr).Info("gateway: starting gateway udp listener")
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		return nil, err
@@ -116,10 +113,11 @@ func NewClient(bind string, onNew func(Mac) error, onDelete func(Mac) error) (*C
 
 	go func() {
 		for {
-			if err := c.gateways.cleanup(); err != nil {
-				c.log.Errorf("gateway: gateways cleanup failed: %s", err)
+			err := c.gateways.cleanup()
+			if err != nil {
+				log.Printf("gateway: gateways cleanup failed: %v\n", err)
 			}
-			time.Sleep(time.Minute)
+			time.Sleep(gatewayCleanupDuration)
 		}
 	}()
 
@@ -127,7 +125,7 @@ func NewClient(bind string, onNew func(Mac) error, onDelete func(Mac) error) (*C
 		c.wg.Add(1)
 		err := c.readPackets()
 		if !c.closed {
-			c.log.Fatal(err)
+			log.Fatal(err)
 		}
 		c.wg.Done()
 	}()
@@ -136,7 +134,7 @@ func NewClient(bind string, onNew func(Mac) error, onDelete func(Mac) error) (*C
 		c.wg.Add(1)
 		err := c.sendPackets()
 		if !c.closed {
-			c.log.Fatal(err)
+			log.Fatal(err)
 		}
 		c.wg.Done()
 	}()
@@ -144,34 +142,29 @@ func NewClient(bind string, onNew func(Mac) error, onDelete func(Mac) error) (*C
 	return c, nil
 }
 
-func (c *Client) SetLogger(logger *log.Logger) {
-	c.log = logger
-}
+//func (c *Client) SetLogger(logger *log.Logger) {
+//	c.log = logger
+//}
 
-// Close closes the client.
 func (c *Client) Close() error {
-	c.log.Info("gateway: closing gateway client")
 	c.closed = true
 	close(c.udpSendChan)
 	if err := c.conn.Close(); err != nil {
 		return err
 	}
-	c.log.Info("gateway: handling last packets")
 	c.wg.Wait()
+	log.Printf("gateway: closing is done\n")
 	return nil
 }
 
-// RXPacketChan returns the channel containing the received RX packets.
 func (c *Client) RXPacketChan() chan RXPacketBytes {
 	return c.rxChan
 }
 
-// StatsChan returns the channel containg the received gateway stats.
 func (c *Client) StatsChan() chan GatewayStatsPacket {
 	return c.statsChan
 }
 
-// Send sends the given packet to the gateway.
 func (c *Client) Send(txPacket TXPacketBytes) error {
 	gw, err := c.gateways.get(txPacket.TXInfo.MAC)
 	if err != nil {
@@ -189,7 +182,7 @@ func (c *Client) Send(txPacket TXPacketBytes) error {
 	}
 	bytes, err := pullResp.MarshalBinary()
 	if err != nil {
-		return fmt.Errorf("gateway: json marshall PullRespPacket error: %s", err)
+		return fmt.Errorf("gateway: json marshall PullRespPacket error: %v", err)
 	}
 	c.udpSendChan <- udpPacket{
 		data: bytes,
@@ -203,16 +196,14 @@ func (c *Client) readPackets() error {
 	for {
 		i, addr, err := c.conn.ReadFromUDP(buf)
 		if err != nil {
-			return fmt.Errorf("gateway: read from udp error: %s", err)
+			return fmt.Errorf("gateway: read from udp error: %v", err)
 		}
 		data := make([]byte, i)
 		copy(data, buf[:i])
 		go func(data []byte) {
-			if err := c.handlePacket(addr, data); err != nil {
-				c.log.WithFields(log.Fields{
-					"data_base64": base64.StdEncoding.EncodeToString(data),
-					"addr":        addr,
-				}).Errorf("gateway: could not handle packet: %s", err)
+			err := c.handlePacket(addr, data)
+			if err != nil {
+				log.Printf("gateway: could not handle packet from address: %s, data: % X, error: %v", addr.String(), data, err)
 			}
 		}(data)
 	}
@@ -220,21 +211,13 @@ func (c *Client) readPackets() error {
 
 func (c *Client) sendPackets() error {
 	for p := range c.udpSendChan {
-		pt, err := GetPacketType(p.data)
+		_, err := GetPacketType(p.data)
 		if err != nil {
-			c.log.WithFields(log.Fields{
-				"addr":        p.addr,
-				"data_base64": base64.StdEncoding.EncodeToString(p.data),
-			}).Error("gateway: unknown packet type")
+			log.Printf("gateway: could not send packet to address: %s, data: % X, error: %v", p.addr.String(), p.data, err)
 			continue
 		}
-		c.log.WithFields(log.Fields{
-			"addr":             p.addr,
-			"type":             pt,
-			"protocol_version": p.data[0],
-		}).Info("gateway: sending udp packet to gateway")
-
-		if _, err := c.conn.WriteToUDP(p.data, p.addr); err != nil {
+		_, err = c.conn.WriteToUDP(p.data, p.addr)
+		if err != nil {
 			return err
 		}
 	}
@@ -246,12 +229,6 @@ func (c *Client) handlePacket(addr *net.UDPAddr, data []byte) error {
 	if err != nil {
 		return err
 	}
-	c.log.WithFields(log.Fields{
-		"addr":             addr,
-		"type":             pt,
-		"protocol_version": data[0],
-	}).Info("gateway: received udp packet from gateway")
-
 	switch pt {
 	case PushData:
 		return c.handlePushData(addr, data)
@@ -266,7 +243,8 @@ func (c *Client) handlePacket(addr *net.UDPAddr, data []byte) error {
 
 func (b *Client) handlePullData(addr *net.UDPAddr, data []byte) error {
 	var p PullDataPacket
-	if err := p.UnmarshalBinary(data); err != nil {
+	err := p.UnmarshalBinary(data)
+	if err != nil {
 		return err
 	}
 	ack := PullACKPacket{
@@ -280,7 +258,7 @@ func (b *Client) handlePullData(addr *net.UDPAddr, data []byte) error {
 
 	err = b.gateways.set(p.GatewayMAC, gateway{
 		addr:            addr,
-		lastSeen:        time.Now().UTC(),
+		lastSeen:        time.Now(),
 		protocolVersion: p.ProtocolVersion,
 	})
 	if err != nil {
@@ -296,11 +274,11 @@ func (b *Client) handlePullData(addr *net.UDPAddr, data []byte) error {
 
 func (b *Client) handlePushData(addr *net.UDPAddr, data []byte) error {
 	var p PushDataPacket
-	if err := p.UnmarshalBinary(data); err != nil {
+	err := p.UnmarshalBinary(data)
+	if err != nil {
 		return err
 	}
 
-	// ack the packet
 	ack := PushACKPacket{
 		ProtocolVersion: p.ProtocolVersion,
 		RandomToken:     p.RandomToken,
@@ -314,14 +292,13 @@ func (b *Client) handlePushData(addr *net.UDPAddr, data []byte) error {
 		data: bytes,
 	}
 
-	// gateway stats
 	if p.Payload.Stat != nil {
 		b.handleStat(addr, p.GatewayMAC, *p.Payload.Stat)
 	}
 
-	// rx packets
 	for _, rxpk := range p.Payload.RXPK {
-		if err := b.handleRXPacket(addr, p.GatewayMAC, rxpk); err != nil {
+		err := b.handleRXPacket(addr, p.GatewayMAC, rxpk)
+		if err != nil {
 			return err
 		}
 	}
@@ -330,25 +307,15 @@ func (b *Client) handlePushData(addr *net.UDPAddr, data []byte) error {
 
 func (c *Client) handleStat(addr *net.UDPAddr, mac Mac, stat Stat) {
 	gwStats := newGatewayStatsPacket(mac, stat)
-	c.log.WithFields(log.Fields{
-		"addr": addr,
-		"mac":  mac,
-	}).Info("gateway: stat packet received")
 	addIPToGatewayStatsPacket(&gwStats, addr.IP)
-	if gtw, err := c.gateways.get(mac); err != nil && gtw.addr != nil {
+	gtw, err := c.gateways.get(mac)
+	if err != nil && gtw.addr != nil {
 		addIPToGatewayStatsPacket(&gwStats, gtw.addr.IP)
 	}
 	c.statsChan <- gwStats
 }
 
 func (c *Client) handleRXPacket(addr *net.UDPAddr, mac Mac, rxpk RXPK) error {
-	logFields := log.Fields{
-		"addr": addr,
-		"mac":  mac,
-		"data": rxpk.Data,
-	}
-	c.log.WithFields(logFields).Info("gateway: rxpk packet received")
-
 	// decode packet
 	rxPacket, err := newRXPacketFromRXPK(mac, rxpk)
 	if err != nil {
@@ -357,7 +324,6 @@ func (c *Client) handleRXPacket(addr *net.UDPAddr, mac Mac, rxpk RXPK) error {
 
 	// check CRC
 	if c.CheckCrc && rxPacket.RXInfo.CRCStatus != 1 {
-		c.log.WithFields(logFields).Warningf("gateway: invalid packet CRC: %d", rxPacket.RXInfo.CRCStatus)
 		return errors.New("gateway: invalid CRC")
 	}
 	c.rxChan <- rxPacket
@@ -369,23 +335,11 @@ func (c *Client) handleTXACK(addr *net.UDPAddr, data []byte) error {
 	if err := p.UnmarshalBinary(data); err != nil {
 		return err
 	}
-	var errBool bool
 
-	logFields := log.Fields{
-		"mac":          p.GatewayMAC,
-		"random_token": p.RandomToken,
-	}
 	if p.Payload != nil {
 		if p.Payload.TXPKACK.Error != "NONE" {
-			errBool = true
+			log.Printf("gateway: tx ack received from %q: random_token: %d, error: %s\n", p.GatewayMAC.String(), p.RandomToken, p.Payload.TXPKACK.Error)
 		}
-		logFields["error"] = p.Payload.TXPKACK.Error
-	}
-
-	if errBool {
-		c.log.WithFields(logFields).Error("gateway: tx ack received")
-	} else {
-		c.log.WithFields(logFields).Info("gateway: tx ack received")
 	}
 
 	return nil
