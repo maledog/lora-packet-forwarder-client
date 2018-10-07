@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Lobaro/lora-packet-forwarder-client/gateway/band"
+	"github.com/maledog/lora-packet-forwarder-client/gateway/band"
 	. "github.com/smartystreets/goconvey/convey"
 )
 
