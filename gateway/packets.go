@@ -3,7 +3,7 @@ package gateway
 import (
 	"time"
 
-	"github.com/Lobaro/lora-packet-forwarder-client/gateway/band"
+	"github.com/maledog/lora-packet-forwarder-client/gateway/band"
 )
 
 // RXPacket contains the PHYPayload received from the gateway.
